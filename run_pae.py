@@ -9,15 +9,13 @@ import visualization.library.AdamWR.cyclic_scheduler as cyclic_scheduler
 import network.pae as model
 from visualization.visual import EvaluateStreamPlot
 from utils.smpl_model import SMPLXModel
-from utils.utils import rodrigues_2_rot_mat, rotation6d_2_rot_mat
+from utils.utils import *
 import visualization.plotting as plot
 from utils.loss import GeodesicLoss, LossManager, keypoint_3d_loss
 
 import numpy as np
 import torch
 import random
-
-import matplotlib.pyplot as plt
 
 TRAIN_DATASETS = ['ACCAD', 'BMLmovi', 'BioMotionLab_NTroje', 'BMLhandball', 'CMU', 'DanceDB', 'DFaust_67', 
                 'EKUT', 'Eyes_Japan_Dataset', 'HumanEva', 'KIT', 'MPI_HDM05', 
@@ -45,8 +43,6 @@ def main(args):
     restart_period = 10
     restart_mult = 2
 
-    plotting_interval = 500 #update visualization at every n-th batch (visualization only)
-    pca_sequence_count = 100 #number of motion sequences visualized in the PCA (visualization only)
     test_sequence_ratio = 0.01 #ratio of randomly selected test sequences (visualization only)
     #End Parameter Section
 
@@ -64,14 +60,15 @@ def main(args):
         shape = gather.shape
 
         batch = utility.ReadBatchFromMatrix(Data, gather.flatten())
+        label = utility.ReadBatchFromMatrix(Label, gather.flatten())
 
         batch = batch.reshape(shape[0], shape[1], -1)
         batch = batch.permute(0, 2, 1)
         batch = batch.reshape(shape[0], batch.shape[1]*batch.shape[2])
-        return batch
-
-    def Item(value):
-        return value.detach().cpu()
+        label = label.reshape(shape[0], shape[1], -1)
+        label = label.permute(0, 2, 1)
+        label = label.reshape(shape[0], label.shape[1]*label.shape[2])
+        return batch, label
     
     # requested datasets
     if args.datasets is None:
@@ -85,36 +82,53 @@ def main(args):
         all_seq_files += input_seqs
         
     print('Sequences:', len(all_seq_files))
-    
     if args.load_data:
-        with open('data/data.pkl', 'rb') as f:
+        with open('data/train_data.pkl', 'rb') as f:
             data_dict = pickle.load(f)
-        Data = data_dict[args.input_type]
         Frames = data_dict['frames']
+        Data = data_dict[args.input_type].reshape(Frames.shape[0], -1).astype(np.float32)
+        if args.input_type == 'joints_3d':
+            Data -= Data[:,0:1]
         Betas = data_dict['betas']
+        Label = data_dict['pose'].copy()
     else:
-        pose_data = []
-        shape_data = []
-        sequences = []
+        # transform joints_3d to projected coordinats
+        trans_mat = dict(
+            R = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]]),
+            t = [0, -3, 0]
+        )
+        data_dict = dict(
+            pose = [],
+            shape_data = [],
+            sequences = [],
+            joints_3d = [],
+            joints_2d = [],
+        )
         num_frames_all = []
+        
         for i, seq_file in enumerate(all_seq_files):
             data = dict(np.load(seq_file, allow_pickle=True))
             num_frames = data['pose_body'].shape[0]
             pose = np.hstack((data['root_orient'], data['pose_body']))
-            if args.input_dim == 3:
-                pose_data.append(pose)
-            else:
-                rot_mat = rodrigues_2_rot_mat(torch.from_numpy(pose).float())
-                pose_data.append(rot_mat.numpy())
-            shape_data.append(data['betas'])
-            sequences += [i+1] * num_frames
+            data_dict['pose'].append(pose.astype(np.float32))
+            joints_3d = data['joints'] - data['joints'][:,0:1]
+            data_dict['joints_3d'].append(joints_3d.reshape(num_frames,-1).astype(np.float32))
+            joints_3d_trans = (joints_3d - trans_mat['t']) @ trans_mat['R']
+            joints_2d = project_pcl_torch(joints_3d_trans, image_size=[1000,1002]).numpy()
+            data_dict['joints_2d'].append(joints_2d.reshape(num_frames,-1).astype(np.float32))
+            data_dict['shape_data'].append(data['betas'])
+            data_dict['sequences'] += [i+1] * num_frames
             num_frames_all.append(num_frames)
-        Data = np.vstack(pose_data).astype(np.float32)
-        Frames = np.array(sequences)
-        Betas = np.array(shape_data)
-    
+        Label = np.vstack(data_dict['pose'])
+        Frames = np.array(data_dict['sequences'])
+        Betas = np.array(data_dict['shape_data'])
+        Data = np.vstack(data_dict[args.input_type])
+        
+    if args.input_dim == 9:
+        Data = rodrigues_2_rot_mat(torch.from_numpy(Data).float()).numpy()
     Save = args.output_path
-    utility.MakeDirectory(Save)
+    utility.MakeDirectory(Save + '/checkpoints')
+    utility.MakeDirectory(Save + '/parameters')
     gather_padding = (int((frames-1)/2))
     gather_window = np.arange(frames) - gather_padding
 
@@ -147,15 +161,8 @@ def main(args):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-    #Initialize drawing
-    # plt.ion()
-    # _, ax1 = plt.subplots(6,1)
-    # _, ax2 = plt.subplots(phase_channels,5)
-    # _, ax3 = plt.subplots(1,2)
-    # _, ax4 = plt.subplots(2,1)
     dist_amps = []
     dist_freqs = []
-    # loss_history = utility.PlottingWindow("Loss History", ax=ax4, min=0, drawInterval=plotting_interval)
     loss_manager = LossManager()
 
     def mesh_generator(pred_verts, label_verts, faces):
@@ -178,42 +185,82 @@ def main(args):
     body_model = SMPLXModel(bm_fname='/home/nesc525/drivers/0/chen/3DSVC/ignoredata/mosh_files/smplx/neutral/model.npz', 
                             num_betas=16, num_expressions=0, device=device)
     # evaluate
-    if not args.train and args.resume_checkpoint!=None:
+    if args.resume_checkpoint!=None:
+        network = torch.load(os.path.join(args.resume_checkpoint))
+        resume_epoch = int(os.path.basename(args.resume_checkpoint).split('_')[0])
+    else:
+        network = model.Model(
+            input_channels=input_channels,
+            embedding_channels=phase_channels,
+            time_range=frames,
+            window=window,
+            output_channels=output_channels,
+        )
+        resume_epoch = 0
+    network.to(device)
+    # evaluate
+    if not args.train:
         print("Eval Phases")
         # if only run eval, load checkpoint
-        network = torch.load(os.path.join(args.resume_checkpoint))
         vis = EvaluateStreamPlot()
+        per_joint_err = []
+        per_vertex_err = []
+        per_pampjpe = []
         for i in range(0, sample_count, batch_size):
             # utility.PrintProgress(i, sample_count, sample_count/batch_size)
             eval_indices = I[i:i+batch_size]
             betas = Betas[Frames[eval_indices]-1]
             #Run model prediction
             network.eval()
-            eval_batch = LoadBatches(eval_indices)
+            body_model.eval()
+            eval_batch, eval_label = LoadBatches(eval_indices)
             yPred, _, _, _ = network(eval_batch)
+
+            batches = eval_batch.shape[0]
+            yPred = yPred.view(batches, -1, frames).permute(0, 2, 1).contiguous()
+            if args.output_dim == 6:
+                yPred = rotation6d_2_rot_mat(yPred).view(batches, frames, -1)
+            eval_label = eval_label.view(batches, -1, frames).permute(0, 2, 1).contiguous()
+            eval_label = rodrigues_2_rot_mat(eval_label).view(batches, frames, -1)
+            # calculate errors
+            beta = torch.tensor(betas, device=device).float()
+            pred_mesh = body_model(yPred[:,-1], beta)
+            label_mesh = body_model(eval_label[:,-1], beta)
+            pred_vertices = pred_mesh['verts']
+            gt_vertices = label_mesh['verts']
+            pred_3d_joints = pred_mesh['joints']
+            gt_3d_joints = label_mesh['joints']
+            error_vertices = mean_per_vertex_error(pred_vertices, gt_vertices)
+            error_joints = mean_per_joint_position_error(pred_3d_joints, gt_3d_joints)
+            error_joints_pa = reconstruction_error(copy2cpu(pred_3d_joints), copy2cpu(gt_3d_joints[:,:,:3]), reduction=None)
+            per_joint_err.append(error_vertices)
+            per_vertex_err.append(error_joints)
+            per_pampjpe.append(error_joints_pa)
             if args.visual:
-                yPred = yPred.view(eval_batch.shape[0], -1, frames).permute(0, 2, 1).contiguous()
-                eval_batch = eval_batch.view(eval_batch.shape[0], -1, frames).permute(0, 2, 1).contiguous()
-                if args.output_dim == 6:
-                    yPred = rotation6d_2_rot_mat(yPred).view(eval_batch.shape[0], frames, -1)
-                if args.input_dim == 3:
-                    eval_batch = rodrigues_2_rot_mat(eval_batch).view(eval_batch.shape[0], frames, -1)
-                for b in range(batch_size):
-                    beta = torch.tensor(betas[b:b+1], device=device).float()
-                    pred_mesh = body_model(yPred[b][0:1], beta)
-                    label_mesh = body_model(eval_batch[b][0:1], beta)
-                    gen = mesh_generator(Item(pred_mesh['verts'][0]), Item(label_mesh['verts'][0]), Item(pred_mesh['faces']))
+                for b in range(batches):
+                    gen = mesh_generator(copy2cpu(pred_vertices[b]), copy2cpu(gt_vertices[b]), copy2cpu(pred_mesh['faces']))
                     vis.show(gen, fps=30)
+        # save errors
+        output_path = os.path.join(args.output_path, 'error')
+        if not os.path.isdir(output_path):
+            os.makedirs(output_path)
+        j_err = np.hstack(per_joint_err)
+        v_err = np.hstack(per_vertex_err)
+        pa_err = np.hstack(per_pampjpe)
+        np.save(os.path.join(output_path, "per_joint_err"), j_err)
+        np.save(os.path.join(output_path, "per_vertex_err"), v_err)
+        np.save(os.path.join(output_path, "pampjpe"), pa_err)
+        print("mean joint err (cm):", np.mean(j_err)*100)
+        print("mean vertex err (cm):", np.mean(v_err)*100)
+        print("pampjpe (cm):", np.mean(pa_err)*100)
+        with open(os.path.join(output_path, "error.txt"), 'w') as f:
+            f.write("mean joint error: " + str(np.mean(j_err)*100))
+            f.write("\nmean vertex error: " + str(np.mean(v_err)*100))
+            f.write("\npampjpe: " + str(np.mean(pa_err)*100))
+    # train the model
     else:
         #Build network model
         print("Training Phases")
-        network = utility.ToDevice(model.Model(
-            input_channels=input_channels,
-            embedding_channels=phase_channels,
-            time_range=frames,
-            window=window,
-            output_channels=output_channels
-        ))
         #Setup optimizer and loss function
         optimizer = adamw.AdamW(network.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = cyclic_scheduler.CyclicLRWithRestarts(optimizer=optimizer, batch_size=batch_size, epoch_size=sample_count, restart_period=restart_period, t_mult=restart_mult, policy="cosine", verbose=True)
@@ -221,30 +268,30 @@ def main(args):
         criterion_vertices = torch.nn.L1Loss().to(device)
         
         for epoch in range(epochs):
+            epoch += 1 + resume_epoch
             scheduler.step()
             rng.shuffle(I)
             start_time = time.time()
             for i in range(0, sample_count, batch_size):
-                utility.PrintProgress(i, sample_count, sample_count/batch_size)
+                # utility.PrintProgress(i, sample_count, sample_count/batch_size)
                 train_indices = I[i:i+batch_size]
                 betas = torch.tensor(Betas[Frames[train_indices]-1]).float().to(device)
-                # betas = betas[:,None,:].repeat(1,frames,1).reshape(-1,16)
 
                 #Run model prediction
                 network.train()
-                train_batch = LoadBatches(train_indices)
+                train_batch, train_label = LoadBatches(train_indices)
                 yPred, latent, signal, params = network(train_batch)
-                yPred = yPred.view(train_batch.shape[0], -1, frames).permute(0, 2, 1).contiguous()
-                train_batch = train_batch.view(train_batch.shape[0], -1, frames).permute(0, 2, 1).contiguous()
+                batches = train_batch.shape[0]
+                yPred = yPred.view(batches, -1, frames).permute(0, 2, 1).contiguous()
                 if args.output_dim == 6:
-                    yPred = rotation6d_2_rot_mat(yPred).view(train_batch.shape[0], frames, -1)
-                pred_mesh = body_model(yPred[:,0], betas)
-                if args.input_dim == 3:
-                    train_batch = rodrigues_2_rot_mat(train_batch).view(train_batch.shape[0], frames, -1)
-                gt_mesh = body_model(train_batch[:,0], betas)
+                    yPred = rotation6d_2_rot_mat(yPred).view(batches, frames, -1)
+                pred_mesh = body_model(yPred[:,-1], betas)
+                train_label = train_label.view(batches, -1, frames).permute(0, 2, 1).contiguous()
+                train_label = rodrigues_2_rot_mat(train_label).view(batches, frames, -1)
+                gt_mesh = body_model(train_label[:,-1], betas)
                     
                 #Compute loss and train
-                pose_loss = loss_function(yPred, train_batch)
+                pose_loss = loss_function(yPred, train_label)
                 loss_3d_joints = args.loss_weight * keypoint_3d_loss(criterion_3d_joints, pred_mesh['joints'], gt_mesh['joints'], device)
                 loss_vertices = args.loss_weight * keypoint_3d_loss(criterion_vertices, pred_mesh['verts'], gt_mesh['verts'], device)
                 
@@ -259,32 +306,32 @@ def main(args):
                 scheduler.batch_step()
 
                 #Start Visualization Section
-                _a_ = Item(params[2]).squeeze().numpy()
+                _a_ = copy2cpu(params[2]).squeeze()
                 for i in range(_a_.shape[0]):
                     dist_amps.append(_a_[i,:])
                 while len(dist_amps) > 10000:
                     dist_amps.pop(0)
 
-                _f_ = Item(params[1]).squeeze().numpy()
+                _f_ = copy2cpu(params[1]).squeeze()
                 for i in range(_f_.shape[0]):
                     dist_freqs.append(_f_[i,:])
                 while len(dist_freqs) > 10000:
                     dist_freqs.pop(0)
 
-            torch.save(network, Save + "/"+str(epoch+1)+"_"+str(phase_channels)+"Channels"+".pt") 
+            torch.save(network, Save + "/checkpoints/"+str(epoch)+"_"+str(phase_channels)+"Channels"+".pt") 
 
-            print('Epoch', epoch+1, 'loss', Item(loss).numpy())
-            loss_manager.calculate_epoch_loss(os.path.join(args.output_path, 'loss/train'), epoch+1)
+            print('Epoch', epoch, 'loss', copy2cpu(loss))
+            loss_manager.calculate_epoch_loss(os.path.join(args.output_path, 'loss/train'), epoch)
 
             #Save Phase Parameters
             print("Saving Parameters")
             network.eval()
             E = np.arange(sample_count)
-            with open(Save+'/Parameters_'+str(epoch+1)+'.txt', 'w') as file:
+            with open(Save+'/parameters/Parameters_'+str(epoch)+'.txt', 'w') as file:
                 for i in range(0, sample_count, batch_size):
                     # utility.PrintProgress(i, sample_count)
                     eval_indices = E[i:i+batch_size]
-                    eval_batch = LoadBatches(eval_indices)
+                    eval_batch, _ = LoadBatches(eval_indices)
                     _, _, _, params = network(eval_batch)
                     p = utility.ToNumpy(params[0]).squeeze()
                     f = utility.ToNumpy(params[1]).squeeze()
@@ -302,7 +349,7 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--amass_root', type=str, default='/home/nesc525/drivers/4/chen/humor/data/amass_processed', help='Root directory of AMASS dataset.')
+    parser.add_argument('--amass_root', type=str, default='./data/amass_processed', help='Root directory of AMASS dataset.')
     parser.add_argument('--datasets', type=str, nargs='+', default=None, help='Which datasets to process. By default processes all.')
     parser.add_argument('--output_path', type=str, default='./output', help='Root directory to save output to.')
     parser.add_argument("--epochs", default=10, type=int, help="Total number of training epochs to perform.")

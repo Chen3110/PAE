@@ -3,3 +3,5 @@ output
 data
 nohup.out
 human_body_prior
+.vscode
+test*
